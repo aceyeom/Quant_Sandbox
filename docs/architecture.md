@@ -17,6 +17,15 @@ Main Responsibility:
   - Open, High, Low, Close
   - Volume
 
+### Data Management & Freshness
+- The dataset is static and covers 2000–2019 (historical reference data)
+- On each training request, the API loads the full dataset into memory
+- The cutoff date determines the train/test boundary and must be strictly enforced:
+  - Training data: all rows with `Date <= cutoff_date`
+  - Prediction data: all rows with `Date > cutoff_date`
+- Feature engineering always uses data strictly before the cutoff date
+- Time ordering is enforced; any gaps or out-of-order dates trigger validation failure
+
 
 
 ## Prediction Target
@@ -49,23 +58,35 @@ how short-term vs long-term market behavior affects predictions.
 
 Notes:
 - `N` is chosen via sliders but passed as integers internally
-- Features are dropped automatically if insufficient history exists
+- **Critical:** Feature windows do NOT shift with the cutoff date. They always look backward from each date in the training period.
+- Features are dropped automatically if insufficient history exists (e.g., if a 30-day momentum is requested but only 20 days of prior data exist before the cutoff, that feature is excluded)
 - Feature engineering must be deterministic and stateless
-- Features must be intuitive for beginner friendly user
+- Features must be intuitive for beginner-friendly users
+- **Validation Rule:** If after dropping insufficient-history features, fewer than 2 features remain, the training request is rejected
 
 
 
 ## Machine Learning Models
-Ridge Regression:
-- Linear model with L2 regularization
-- Used for interpretability
-- Coefficients are exposed
-- Regularization controlled via `alpha`
 
-Random Forest:
+### Training Methodology
+- **Train/Test Split:** Single cutoff date (user-provided or default)
+  - Training set: historical data up to cutoff (fitted on known returns)
+  - Test set: data after cutoff (evaluated on actual returns, never used for training)
+- **Hyperparameter Handling:**
+  - Ridge: `alpha` (L2 regularization strength) is configurable via UI or defaults to 1.0
+  - Random Forest: `n_estimators` defaults to 100, `max_depth` defaults to None (full growth), `random_state` fixed to ensure reproducibility
+- **No nested cross-validation:** Given the time-series nature of stock data, k-fold CV would introduce look-ahead bias. A single train/test split respects temporal ordering.
+
+### Ridge Regression
+- Linear model with L2 regularization
+- Used for interpretability and explainability
+- Coefficients are exposed to users (positive/negative relationships)
+- Regularization strength controlled via `alpha` parameter
+
+### Random Forest
 - Non-linear ensemble model
-- Used for comparison
-- Feature importance exposed
+- Used as a non-linear baseline for comparison
+- Feature importance scores are exposed (relative contribution of each feature)
 - Fixed random seed by default for reproducibility
 
 
@@ -114,12 +135,28 @@ Plain-English summary of model behavior and performance
 
 
 ## API Flow
+
+### Request Validation
+Before training begins, inputs are validated:
+- Cutoff date is within the dataset's date range
+- Selected symbol exists in the dataset
+- Feature windows are positive integers within reasonable bounds (e.g., 2–250 days)
+- At least 2 valid features remain after dropping those with insufficient history
+- Prediction horizon is positive and leaves enough test data
+
+### Training Request Handling
 1. Client requests available datasets and symbols
-2. Client submits a training request with model and feature parameters
-3. Backend validates inputs and checks cache
-4. If cached, results are returned immediately
-5. If not cached, a training job is executed
-6. Results are stored and returned to the client
+2. Client submits a training request with model type, feature parameters, and cutoff date
+3. Backend constructs a deterministic cache key from all parameters
+4. Backend validates inputs (see above); returns error immediately if invalid
+5. Cache is checked:
+   - **If hit:** Results are returned immediately
+   - **If miss:** A training job is queued
+6. **Async Behavior:** `/train` endpoint returns a job ID immediately (non-blocking)
+   - Client polls `/status/{job_id}` to check progress
+   - `/results/{job_id}` retrieves completed results (returns 202 Accepted if not ready)
+7. Results are stored in cache and returned to client
+8. Cached results are reused for identical parameter combinations until cache is cleared
 
 
 
@@ -129,6 +166,7 @@ The codebase is organized by responsibility so that data loading,
 feature generation, model logic, evaluation, and API orchestration
 remain explicit, interpretable, and reproducible.
 
+```
 src/
   data/
     loader.py            # Load CSV data, filter by symbol and date range,
@@ -147,31 +185,33 @@ src/
     base.py              # Shared model interface (fit, predict, explain)
 
   evaluation/
-    metrics.py           # RMSE, directional accuracy
-    baselines.py         # Naive baselines (e.g. zero-return predictor)
+    metrics.py           # RMSE, directional accuracy, baseline comparisons
+    baselines.py         # Naive baselines (e.g., zero-return or mean-return predictor)
 
   api/
-    train.py             # /train endpoint:
+    train.py             # POST /train endpoint:
                          # - request validation
                          # - feature construction
                          # - model training and evaluation
-    status.py            # /status endpoint for long-running jobs
-    results.py           # /results endpoint returning predictions and metrics
+                         # - returns job_id immediately
+    status.py            # GET /status/{job_id} endpoint for polling long-running jobs
+    results.py           # GET /results/{job_id} endpoint returning predictions and metrics
 
   cache/
-    keys.py              # Deterministic cache key construction
-    store.py             # Cache interface (in-memory or Redis)
+    keys.py              # Deterministic cache key construction from parameters
+    store.py             # Cache interface abstraction (in-memory or Redis)
 
   jobs/
-    runner.py            # Optional background job execution logic
-    queue.py             # Job queue abstraction (if enabled)
+    runner.py            # Background job execution logic (training pipeline)
+    queue.py             # Job queue abstraction (FIFO or priority-based)
 
-  config.py              # Global configuration (paths, seeds, limits)
-  schemas.py             # Request / response schemas for API payloads
+  config.py              # Global configuration (paths, seeds, limits, defaults)
+  schemas.py             # Pydantic schemas for request/response validation
 
 docs/
   architecture.md        # System design, data flow, and interaction mapping
-  api.md                 # API behavior and endpoint documentation
+  api.md                 # API endpoint documentation and examples
+```
 
 
 ## Reference

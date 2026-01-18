@@ -123,6 +123,8 @@ plt.xlabel("Importance")
 plt.grid(True, alpha=0.3)
 
 plt.tight_layout()
+plt.savefig('random_forest_analysis.png', dpi=150, bbox_inches='tight')
+print("\nPlot saved as: random_forest_analysis.png")
 plt.show()
 
 # --------------------------------------

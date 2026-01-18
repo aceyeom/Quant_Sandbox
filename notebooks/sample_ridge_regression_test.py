@@ -119,6 +119,8 @@ plt.xlabel("Coefficient Value")
 plt.grid(True, alpha=0.3)
 
 plt.tight_layout()
+plt.savefig('ridge_regression_analysis.png', dpi=150, bbox_inches='tight')
+print("\nPlot saved as: ridge_regression_analysis.png")
 plt.show()
 
 # --------------------------------------

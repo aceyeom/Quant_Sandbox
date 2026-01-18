@@ -114,6 +114,8 @@ plt.xticks(rotation=45)
 plt.grid(True, alpha=0.3)
 
 plt.tight_layout()
+plt.savefig('model_comparison_analysis.png', dpi=150, bbox_inches='tight')
+print("\nPlot saved as: model_comparison_analysis.png")
 plt.show()
 
 # Print performance metrics

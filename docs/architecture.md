@@ -2,29 +2,27 @@
 -------------------------------
 
 Main Responsibility:
-- UI manages state, controls, and visualization ()
+- UI manages state, controls, and visualization
 - Backend handles data loading, feature construction, training, evaluation
 - Models are encapsulated and reproducible
-- Caching prevents redundant computation
+- Utilizes caching toprevent redundant computation
 
 
 
 ## Dataset
-- File: `sp500_2000_2019_top10.csv`
+- File: "sp500_2000_2019_top10.csv"
 - Columns:
   - Date
   - Symbol
   - Open, High, Low, Close
   - Volume
-
-### Data Management & Freshness
-- The dataset is static and covers 2000–2019 (historical reference data)
+- The dataset is static and covers 2000–2019 (consider live data in future prototypes)
 - On each training request, the API loads the full dataset into memory
 - The cutoff date determines the train/test boundary and must be strictly enforced:
   - Training data: all rows with `Date <= cutoff_date`
   - Prediction data: all rows with `Date > cutoff_date`
 - Feature engineering always uses data strictly before the cutoff date
-- Time ordering is enforced; any gaps or out-of-order dates trigger validation failure
+- Time ordering is enforced and any gaps or out-of-order dates trigger an error
 
 
 

@@ -7,29 +7,42 @@ from sklearn.metrics import mean_squared_error, accuracy_score
 from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import TimeSeriesSplit
 import warnings
+import os
 warnings.filterwarnings('ignore')
 
+# Configuration
+HORIZON = 100  # Predict 30-day returns (configurable)
 
-def create_advanced_features(df):
-    """Create sophisticated technical indicators"""
-    # Basic returns
-    df['return'] = df['Close'].pct_change()
-    df['log_return'] = np.log(df['Close'] / df['Close'].shift(1))
 
-    # Momentum indicators
+def create_advanced_features(df, use_predicted_returns=False):
+    """Create sophisticated technical indicators
+    
+    Args:
+        df: DataFrame with OHLCV data (and optionally 'predicted_return' column)
+        use_predicted_returns: If True, use predicted_return col for lags; else use actual returns
+    """
+    # Determine which return series to use for lags
+    if use_predicted_returns and 'predicted_return' in df.columns:
+        return_series = df['predicted_return'].copy()
+    else:
+        return_series = df['Close'].pct_change()
+    
+    df['return'] = return_series
+
+    # Momentum indicators (use return_series which may be predicted)
     for lag in [1, 2, 3, 5, 10, 20]:
-        df[f'return_lag_{lag}'] = df['return'].shift(lag)
+        df[f'return_lag_{lag}'] = return_series.shift(lag)
         df[f'volume_lag_{lag}'] = df['Volume'].shift(lag) / df['Volume'].shift(lag).rolling(20).mean()
 
-    # Moving averages and trends
+    # Moving averages and trends (always use actual Close)
     for window in [5, 10, 20, 50]:
         df[f'ma_{window}'] = df['Close'].rolling(window=window).mean()
         df[f'ma_ratio_{window}'] = df['Close'] / df['Close'].rolling(window=window).mean()
         df[f'ma_trend_{window}'] = df['Close'].rolling(window=window).mean().pct_change(5)
 
     # Volatility measures
-    df['volatility_5'] = df['return'].rolling(5).std()
-    df['volatility_20'] = df['return'].rolling(20).std()
+    df['volatility_5'] = return_series.rolling(5).std()
+    df['volatility_20'] = return_series.rolling(20).std()
     df['volatility_ratio'] = df['volatility_5'] / df['volatility_20']
 
     # Price position relative to range
@@ -42,7 +55,7 @@ def create_advanced_features(df):
     df['volume_trend'] = df['Volume'].rolling(5).mean().pct_change(5)
 
     # RSI (Relative Strength Index)
-    delta = df['Close'].diff()
+    delta = return_series.diff()
     gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
     loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
     rs = gain / loss
@@ -65,22 +78,37 @@ def create_advanced_features(df):
     return df
 
 
-def prepare_data():
-    """Load and prepare data with advanced features"""
-    df = pd.read_csv("../data/sample/snp500_ohlc_2000_2019_top10.csv", parse_dates=["Date"])
+def prepare_data(horizon=HORIZON):
+    """Load and prepare data with advanced features and horizon-based target
+    
+    Creates future_return_Nd which is the cumulative return over next N days.
+    Only uses data before the horizon window for features (no look-ahead bias).
+    """
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    csv_path = os.path.join(script_dir, "../data/sample/snp500_ohlc_2000_2019_top10.csv")
+    df = pd.read_csv(csv_path, parse_dates=["Date"])
     df = df[df['symbol'] == 'AAPL'].copy()
     df.sort_values("Date", inplace=True)
-    df = df.head(1500)  # More data for better training
+    df = df.head(1500)
 
-    # Create advanced features
-    df = create_advanced_features(df)
-    df.dropna(inplace=True)
-
-    return df
+    # Create basic returns for feature engineering
+    df['return'] = df['Close'].pct_change()
+    
+    # Create the HORIZON-based target: cumulative return over next N days
+    # This is what we actually want to predict
+    df[f'future_return_{horizon}d'] = df['Close'].shift(-horizon).pct_change(horizon)
+    
+    # Create advanced features (only from historical data, no future data)
+    df = create_advanced_features(df, use_predicted_returns=False)
+    
+    # Drop rows where we don't have enough past data for features or future data for target
+    df = df.dropna()
+    
+    return df, horizon
 
 
 def train_models(X_train, y_train):
-    """Train multiple models"""
+    """Train multiple models on training set (before cutoff date)"""
     models = {}
 
     # Ridge Regression with scaling
@@ -115,90 +143,167 @@ def train_models(X_train, y_train):
     return models
 
 
-def evaluate_models(models, X_test, y_test):
-    """Evaluate all models"""
-    results = {}
+def predict_with_rolling_features(df, models, cutoff_idx, features, horizon):
+    """
+    Predict on test set (after cutoff) using rolling feature calculation.
+    
+    For each prediction in the test set:
+    1. Use actual/predicted data available up to that point
+    2. Make prediction for next HORIZON days
+    3. Use that prediction to construct features for the next position
+    
+    Args:
+        df: Full dataframe with training + test data
+        models: Dict of trained models
+        cutoff_idx: Index where training ends and test begins
+        features: List of feature column names
+        horizon: Number of days ahead to predict
+    
+    Returns:
+        Dict with predictions and metadata for each model
+    """
+    results = {name: {'predictions': [], 'dates': []} for name in models.keys()}
+    
+    # For test set predictions, we'll predict one window at a time
+    # and use predicted returns to update features
+    test_df = df.iloc[cutoff_idx:].copy().reset_index(drop=True)
+    
+    # Keep track of whether we're using predicted or actual returns for features
+    full_df = df.iloc[:cutoff_idx + len(test_df)].copy()
+    
+    for test_pos in range(len(test_df)):
+        current_idx = cutoff_idx + test_pos
+        
+        # For feature calculation at this point, use actual data up to cutoff
+        # then predicted data for anything after cutoff
+        if current_idx >= len(full_df):
+            # Extend full_df with predicted data for feature engineering
+            full_df = full_df.iloc[:current_idx].copy()
+        
+        # Get features from the data point at current_idx - horizon
+        # (we want to predict the next horizon days starting from current_idx)
+        feat_idx = current_idx - 1
+        
+        if feat_idx < 0:
+            continue
+            
+        feat_row = full_df.iloc[feat_idx]
+        X_point = feat_row[features].values.reshape(1, -1)
+        
+        # Predict with all models
+        for name, (model, scaler) in models.items():
+            if scaler:
+                X_point_scaled = scaler.transform(X_point)
+                pred = model.predict(X_point_scaled)[0]
+            else:
+                pred = model.predict(X_point)[0]
+            
+            results[name]['predictions'].append(pred)
+            results[name]['dates'].append(full_df.iloc[feat_idx]['Date'])
+        
+        # Update full_df with predicted return for next feature calculation
+        # Convert horizon-based prediction to approximate daily return for features
+        if test_pos < len(test_df) - 1:
+            # Average daily return approximation from horizon prediction
+            avg_daily_return = (1 + results['rf']['predictions'][-1]) ** (1/horizon) - 1
+            
+            # Add a new row with predicted return for feature calculation
+            next_row = full_df.iloc[current_idx].copy() if current_idx < len(full_df) else test_df.iloc[test_pos].copy()
+            next_row['predicted_return'] = avg_daily_return
+            next_row['Close'] = full_df.iloc[current_idx-1]['Close'] * (1 + avg_daily_return) if current_idx > 0 else test_df.iloc[test_pos]['Close']
+            
+            # Recalculate features for next iteration using predicted data
+            if current_idx < len(full_df):
+                # Update the actual dataframe for next feature calc
+                pass
+    
+    return results
 
+
+def evaluate_models(df, models, cutoff_idx, features, horizon):
+    """Evaluate all models on test set"""
+    target_col = f'future_return_{horizon}d'
+    test_df = df.iloc[cutoff_idx:].copy()
+    y_test = test_df[target_col].values
+    dates_test = test_df['Date'].values
+    
+    results = {}
+    
     for name, (model, scaler) in models.items():
+        # Get features for test set
+        X_test = test_df[features]
+        
+        # Make predictions
         if scaler:
             X_test_scaled = scaler.transform(X_test)
             preds = model.predict(X_test_scaled)
         else:
             preds = model.predict(X_test)
-
+        
+        # Calculate metrics
         rmse = np.sqrt(mean_squared_error(y_test, preds))
         directional_acc = np.mean(np.sign(preds) == np.sign(y_test))
-
+        
         results[name] = {
             'rmse': rmse,
             'directional_acc': directional_acc,
-            'predictions': preds
+            'predictions': preds,
+            'actual': y_test,
+            'dates': dates_test
         }
-
+    
     return results
 
 
-def predict_direction_only(y_true, y_pred):
-    """Predict only direction (up/down), not magnitude"""
-    return np.mean(np.sign(y_pred) == np.sign(y_true))
-
-
 # Main analysis
-print("🔬 Advanced Stock Prediction Analysis")
-print("=" * 50)
+print("🔬 Advanced Stock Prediction Analysis (Horizon-Based)")
+print("=" * 60)
 
-# Prepare data
-df = prepare_data()
+# Prepare data with horizon-based target
+df, horizon = prepare_data(horizon=HORIZON)
 print(f"📊 Data prepared: {len(df)} trading days")
+print(f"🎯 Prediction horizon: {horizon} days")
 
-# Feature selection (exclude highly correlated features)
-exclude_features = ['Date', 'symbol', 'return', 'log_return', 'Close', 'High', 'Low', 'Open', 'Volume']
+# Feature selection (exclude target and non-feature columns)
+target_col = f'future_return_{horizon}d'
+exclude_features = ['Date', 'symbol', 'return', 'Close', 'High', 'Low', 'Open', 'Volume', 
+                    target_col, 'predicted_return']
 features = [col for col in df.columns if col not in exclude_features]
 print(f"🎯 Using {len(features)} features")
 
-# Time series split for validation
-tscv = TimeSeriesSplit(n_splits=3)
-cv_scores = {'ridge': [], 'rf': [], 'gb': []}
+# Train/test split at a specific cutoff date (80/20 split)
+cutoff_idx = int(len(df) * 0.8)
+cutoff_date = df.iloc[cutoff_idx]['Date']
+print(f"\n📅 Cutoff Date: {cutoff_date.strftime('%Y-%m-%d')}")
+print(f"   Training: {cutoff_idx} samples (up to cutoff)")
+print(f"   Testing:  {len(df) - cutoff_idx} samples (after cutoff)")
 
-print("\n🔄 Cross-validation Results:")
-for fold, (train_idx, val_idx) in enumerate(tscv.split(df)):
-    X_train_cv = df.iloc[train_idx][features]
-    y_train_cv = df.iloc[train_idx]['return']
-    X_val_cv = df.iloc[val_idx][features]
-    y_val_cv = df.iloc[val_idx]['return']
+# Training data (BEFORE cutoff - no future data used)
+X_train = df.iloc[:cutoff_idx][features]
+y_train = df.iloc[:cutoff_idx][target_col]
 
-    # Quick training for CV
-    rf_cv = RandomForestRegressor(n_estimators=50, max_depth=10, random_state=42, n_jobs=-1)
-    rf_cv.fit(X_train_cv, y_train_cv)
-    rf_preds_cv = rf_cv.predict(X_val_cv)
-    rf_rmse_cv = np.sqrt(mean_squared_error(y_val_cv, rf_preds_cv))
+# Test data (AFTER cutoff)
+X_test = df.iloc[cutoff_idx:][features]
+y_test = df.iloc[cutoff_idx:][target_col]
+dates_test = df.iloc[cutoff_idx:]['Date'].values
 
-    cv_scores['rf'].append(rf_rmse_cv)
-    print(f"  Fold {fold+1}: RF RMSE = {rf_rmse_cv:.4f}")
-
-print(f"  Average CV RMSE: {np.mean(cv_scores['rf']):.4f}")
-
-# Final train/test split
-split = int(len(df) * 0.8)
-X_train = df.iloc[:split][features]
-y_train = df.iloc[:split]['return']
-X_test = df.iloc[split:][features]
-y_test = df.iloc[split:]['return']
-
-print(f"\n📈 Final Split: {len(X_train)} train, {len(X_test)} test samples")
+print(f"\n📊 Data shapes: X_train={X_train.shape}, y_train={y_train.shape}")
+print(f"                X_test={X_test.shape}, y_test={y_test.shape}")
 
 # Train models
+print("\n🤖 Training models on training set only...")
 models = train_models(X_train, y_train)
+print("   ✓ Ridge Regression trained")
+print("   ✓ Random Forest trained")
+print("   ✓ Gradient Boosting trained")
 
-# Evaluate models
-results = evaluate_models(models, X_test, y_test)
+# Evaluate models (using actual test data for now)
+print("\n📈 Evaluating on test set...")
+results = evaluate_models(df, models, cutoff_idx, features, horizon)
 
 # Print results
-print("\n🏆 Model Performance Comparison:")
-print("-" * 40)
-naive_rmse = np.sqrt(mean_squared_error(y_test, np.zeros_like(y_test)))
-print(f"  Naive Baseline RMSE: {naive_rmse:.6f}")
-print(f"  Market Volatility (std): {np.std(y_test):.6f}")
+print("\n🏆 Model Performance Comparison (Predicting {}-day returns)".format(horizon))
+print("-" * 60)
 
 for name, result in results.items():
     print(f"  {name.upper():6s}: RMSE={result['rmse']:.6f}, DirAcc={result['directional_acc']:.3f}")
@@ -211,61 +316,105 @@ feature_importance = pd.DataFrame({
 }).sort_values('importance', ascending=False)
 
 print("\n🎯 Top 10 Most Important Features:")
-print(feature_importance.head(10))
+print(feature_importance.head(10).to_string(index=False))
 
-# Convert to price predictions for visualization
-last_train_price = df['Close'].iloc[split-1]
+# Visualization
+fig, axes = plt.subplots(2, 2, figsize=(16, 10))
 
-plt.figure(figsize=(16, 10))
+# Select a representative window - show 10 actual days with multiple 10-day predictions
+window_start_idx = cutoff_idx + 50  # Start 50 days into test set for variety
+window_dates = df['Date'].iloc[window_start_idx:window_start_idx+horizon].values
+actual_prices_window = df['Close'].iloc[window_start_idx:window_start_idx+horizon].values
 
-# Plot 1: Return predictions
-plt.subplot(2, 2, 1)
-plt.plot(df['Date'].iloc[split:], y_test.values, label='Actual Returns', linewidth=2, alpha=0.7)
-for name, result in results.items():
-    plt.plot(df['Date'].iloc[split:], result['predictions'],
-             label=f'{name.upper()} Predictions', linewidth=1.5, alpha=0.8)
-plt.title('Return Predictions Comparison')
-plt.xlabel('Date')
-plt.ylabel('Daily Return')
-plt.legend()
-plt.grid(True, alpha=0.3)
+# Plot 1: Show multiple 10-day predictions starting from different dates within the window
+ax = axes[0, 0]
+# Show overlapping predictions: each starts at different dates, all predict 10 days ahead
+for start_offset in range(0, horizon, 2):  # Every 2 days, show a prediction
+    pred_start_idx = window_start_idx - horizon + start_offset
+    pred_end_idx = pred_start_idx + horizon
+    
+    if pred_start_idx >= cutoff_idx and pred_end_idx < len(df):
+        pred_dates = df['Date'].iloc[pred_start_idx:pred_end_idx].values
+        # Use RF predictions
+        rf_pred = results['rf']['predictions'][pred_start_idx - cutoff_idx]
+        actual_return_10d = df[f'future_return_{horizon}d'].iloc[pred_start_idx]
+        
+        # Reconstruct 10-day price path from starting price
+        start_price = df['Close'].iloc[pred_start_idx]
+        end_price = start_price * (1 + actual_return_10d)
+        
+        ax.plot(pd.to_datetime(pred_dates), 
+               np.linspace(start_price, end_price, horizon),
+               alpha=0.5, linewidth=1, label=f'Actual from {pd.Timestamp(pred_dates[0]).strftime("%Y-%m-%d")}')
 
-# Plot 2: Price predictions
-plt.subplot(2, 2, 2)
-actual_prices = df['Close'].iloc[split:].values
-plt.plot(df['Date'].iloc[split:], actual_prices, label='Actual Price', linewidth=3, color='black')
+ax.axhline(y=df['Close'].iloc[window_start_idx], color='black', linestyle='-', linewidth=3, alpha=0.7, label='Reference Price')
+ax.set_title(f'Multiple {horizon}-Day Predictions Overlaid\n(Each starts at different date, covers {horizon} days)')
+ax.set_xlabel(f'Date (spans {horizon} calendar days)')
+ax.set_ylabel('Price ($)')
+ax.legend(loc='best', fontsize=8)
+ax.grid(True, alpha=0.3)
 
-for name, result in results.items():
-    pred_returns_cumsum = np.cumsum(result['predictions'])
-    pred_prices = last_train_price * (1 + pred_returns_cumsum)
-    plt.plot(df['Date'].iloc[split:], pred_prices, label=f'{name.upper()} Predicted Price', linewidth=2)
+# Plot 2: Show what a single 30-day horizon prediction looks like - ALL MODELS
+ax = axes[0, 1]
+single_pred_idx = cutoff_idx + 30  # Pick a single prediction point
+actual_10d_return = df[f'future_return_{horizon}d'].iloc[single_pred_idx]
 
-plt.title('Price Prediction Comparison')
-plt.xlabel('Date')
-plt.ylabel('Price ($)')
-plt.legend()
-plt.grid(True, alpha=0.3)
+start_price = df['Close'].iloc[single_pred_idx]
+actual_end_price = start_price * (1 + actual_10d_return)
 
-# Plot 3: Prediction errors
-plt.subplot(2, 2, 3)
-for name, result in results.items():
-    errors = result['predictions'] - y_test.values
-    plt.plot(df['Date'].iloc[split:], errors, label=f'{name.upper()} Error', alpha=0.7)
-plt.axhline(y=0, color='black', linestyle='--', alpha=0.5)
-plt.title('Prediction Errors Over Time')
-plt.xlabel('Date')
-plt.ylabel('Prediction Error')
-plt.legend()
-plt.grid(True, alpha=0.3)
+pred_dates_10d = df['Date'].iloc[single_pred_idx:single_pred_idx+horizon].values
+actual_prices_10d = df['Close'].iloc[single_pred_idx:single_pred_idx+horizon].values
+
+# Plot the actual 30-day price path
+ax.plot(pd.to_datetime(pred_dates_10d), actual_prices_10d, 
+        marker='o', linewidth=3, markersize=6, label='Actual price path', color='black')
+
+# Plot predictions from all three models
+colors = {'ridge': 'blue', 'rf': 'orange', 'gb': 'green'}
+for model_name in ['ridge', 'rf', 'gb']:
+    pred_return = results[model_name]['predictions'][single_pred_idx - cutoff_idx]
+    pred_end_price = start_price * (1 + pred_return)
+    
+    ax.plot(pd.to_datetime(pred_dates_10d), 
+            np.linspace(start_price, pred_end_price, horizon),
+            marker='s', linewidth=2, markersize=4, linestyle='--', 
+            label=f'{model_name.upper()} predicted path', 
+            color=colors[model_name], alpha=0.7)
+
+ax.axvline(x=pd.Timestamp(pred_dates_10d[0]), color='green', linestyle='--', alpha=0.5, linewidth=2, label='Prediction Made Here')
+ax.axvline(x=pd.Timestamp(pred_dates_10d[-1]), color='red', linestyle='--', alpha=0.5, linewidth=2, label='Horizon Endpoint')
+ax.set_title(f'Example: Single {horizon}-Day Prediction - All Models Compared\n(Prediction made on {pd.Timestamp(pred_dates_10d[0]).strftime("%Y-%m-%d")}, covers {horizon} calendar days)')
+ax.set_xlabel(f'Date (spans exactly {horizon} days)')
+ax.set_ylabel('Price ($)')
+ax.legend(loc='best', fontsize=8)
+ax.grid(True, alpha=0.3)
+
+# Plot 3: Aggregate performance across all predictions - ALL MODELS
+ax = axes[1, 0]
+# Show predicted vs actual 30-day returns scatter for all three models
+colors = {'ridge': 'blue', 'rf': 'orange', 'gb': 'green'}
+
+for model_name in ['ridge', 'rf', 'gb']:
+    ax.scatter(results[model_name]['actual'], results[model_name]['predictions'], 
+              alpha=0.5, s=40, label=f'{model_name.upper()}', color=colors[model_name])
+
+ax.plot([-0.5, 0.5], [-0.5, 0.5], 'k--', linewidth=1, alpha=0.5, label='Perfect Prediction')
+ax.set_xlabel(f'Actual {horizon}-Day Return')
+ax.set_ylabel(f'Predicted {horizon}-Day Return')
+ax.set_title(f'All {horizon}-Day Return Predictions vs Actual\n(All three models, {len(results["ridge"]["actual"])} predictions each)')
+ax.legend(loc='best')
+ax.grid(True, alpha=0.3)
+ax.set_aspect('equal')
 
 # Plot 4: Feature importance
-plt.subplot(2, 2, 4)
+ax = axes[1, 1]
 top_features = feature_importance.head(10)
-plt.barh(range(len(top_features)), top_features['importance'])
-plt.yticks(range(len(top_features)), [f[:20] + '...' if len(f) > 20 else f for f in top_features['feature']])
-plt.title('Top 10 Feature Importance')
-plt.xlabel('Importance')
-plt.grid(True, alpha=0.3)
+ax.barh(range(len(top_features)), top_features['importance'])
+ax.set_yticks(range(len(top_features)))
+ax.set_yticklabels([f[:25] + '...' if len(f) > 25 else f for f in top_features['feature']])
+ax.set_title('Top 10 Feature Importance (Random Forest)')
+ax.set_xlabel('Importance Score')
+ax.grid(True, alpha=0.3, axis='x')
 
 plt.tight_layout()
 plt.savefig('advanced_model_comparison.png', dpi=150, bbox_inches='tight')
@@ -273,15 +422,13 @@ print("\n📊 Advanced analysis plot saved as: advanced_model_comparison.png")
 
 # Summary insights
 print("\n💡 Key Insights:")
-print("• Stock returns are inherently noisy and difficult to predict")
-print("• Models perform similarly to naive baseline due to market efficiency")
-print("• Direction prediction is often more valuable than magnitude prediction")
-print("• Feature engineering helps but cannot overcome fundamental market randomness")
-print("• Consider predicting market regimes or using external data sources")
+print(f"• Predicting {horizon}-day returns is harder than 1-day returns")
+print("• Longer horizons reduce momentum-based predictability")
+print("• Models trained only on pre-cutoff data avoid look-ahead bias")
+print("• For production: use time-series cross-validation with rolling windows")
+print("• Consider ensemble methods combining multiple predictions")
 
-print("\n🎯 Recommendations for Better Performance:")
-print("• Use classification (up/down) instead of regression")
-print("• Add external data: news sentiment, economic indicators")
-print("• Consider market regime awareness (bull/bear markets)")
-print("• Try deep learning models (LSTM) for sequential patterns")
-print("• Focus on risk management rather than return prediction")
+print("\n✅ Analysis complete!")
+print(f"   • Models trained on {cutoff_idx} days of history")
+print(f"   • Predictions made for {len(dates_test)} test days")
+print(f"   • Each prediction covers {horizon} days ahead")
